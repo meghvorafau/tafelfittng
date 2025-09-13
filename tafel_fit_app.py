@@ -1,4 +1,3 @@
-
 import io
 import json
 import math
@@ -15,7 +14,8 @@ F = 96485.33212  # C/mol
 R = 8.314462618  # J/mol/K
 
 st.title("Global Implicit Tafel Fit")
-st.caption("Single implicit model: Butler–Volmer (anodic + cathodic) + Koutecky–Levich diffusion (ORR) + Ohmic drop Ru. Solve point‑wise with Newton; fit globally.")
+st.caption("Single implicit model: Butler–Volmer (anodic + cathodic) + Koutecky–Levich diffusion (ORR) + Ohmic drop Ru. "
+           "Solve point-wise with Newton; fit globally.")
 
 # -------------------- Physics --------------------
 def beta_from_alpha(alpha, n=1, T=298.15):
@@ -23,7 +23,7 @@ def beta_from_alpha(alpha, n=1, T=298.15):
     return 2.303 * R * T / (max(alpha, 1e-6) * n * F)
 
 def newton_current_for_E(E, pars, T=298.15, n=1, i_init=None):
-    \"\"\"
+    """
     Solve implicit equation for current density i at given potential E:
       η = E − E_corr − i*Ru
       i_a = i0_a * exp( +α_a nF η / RT )
@@ -32,20 +32,17 @@ def newton_current_for_E(E, pars, T=298.15, n=1, i_init=None):
       i_total = i_a + i_c,eff
       Find i such that f(i) = i − (i_a + i_c,eff) = 0
     Uses damped Newton iterations with analytic df/di via chain rule.
-    \"\"\"
-    i0_a = pars[\"i0_a\"]
-    alpha_a = pars[\"alpha_a\"]
-    i0_c = pars[\"i0_c\"]
-    alpha_c = pars[\"alpha_c\"]
-    iL = pars[\"iL\"]
-    Ecorr = pars[\"Ecorr\"]
-    Ru = pars[\"Ru\"]
+    """
+    i0_a = pars["i0_a"]
+    alpha_a = pars["alpha_a"]
+    i0_c = pars["i0_c"]
+    alpha_c = pars["alpha_c"]
+    iL = pars["iL"]
+    Ecorr = pars["Ecorr"]
+    Ru = pars["Ru"]
 
     # Initial guess
-    if i_init is None:
-        i = 0.0
-    else:
-        i = float(i_init)
+    i = 0.0 if i_init is None else float(i_init)
 
     # Precompute factors
     k_a = (alpha_a * n * F) / (R * T)
@@ -60,8 +57,6 @@ def newton_current_for_E(E, pars, T=298.15, n=1, i_init=None):
         i_c_act = - i0_c * math.exp(-k_c * eta)         # cathodic, negative
 
         # Koutecky–Levich combination for cathodic with diffusion limit (-iL plateau)
-        # 1 / i_c = 1 / i_c_act + 1 / (-iL)
-        # => i_c = (i_c_act * -iL) / (i_c_act - iL)
         denom = (i_c_act - iL)
         if abs(denom) < 1e-30:
             denom = -1e-30 if denom < 0 else 1e-30
@@ -69,19 +64,11 @@ def newton_current_for_E(E, pars, T=298.15, n=1, i_init=None):
 
         f = i - (i_a + i_c)
 
-        # df/di = 1 - d/di (i_a + i_c) = 1 - (di_a/dη + di_c/dη) * dη/di
-        # dη/di = -Ru
-        # di_a/dη = i_a * k_a
+        # df/di = 1 - (di_a/dη + di_c/dη)*dη/di
         di_a_deta = i_a * k_a
-
-        # For i_c: need di_c/dη. First di_c_act/dη = (-i_c_act) * k_c  (since i_c_act = -i0_c*exp(-k_c*η))
         di_cact_deta = (-i_c_act) * k_c
-
-        # i_c = (i_c_act * -iL) / (i_c_act - iL)
-        # Let g = i_c_act. h(g) = (-iL * g)/(g - iL), h'(g) = iL^2/(g - iL)^2
         di_c_dg = (iL**2) / (denom**2)
         di_c_deta = di_c_dg * di_cact_deta
-
         di_sum_deta = di_a_deta + di_c_deta
         d_eta_di = -Ru
         dsum_di = di_sum_deta * d_eta_di
@@ -90,7 +77,7 @@ def newton_current_for_E(E, pars, T=298.15, n=1, i_init=None):
         # Newton step
         step = - f / (dfi + 1e-30)
 
-        # Damping for stability
+        # Damping
         lam = 1.0
         improved = False
         for _ in range(10):
@@ -118,7 +105,6 @@ def newton_current_for_E(E, pars, T=298.15, n=1, i_init=None):
 
 def simulate_curve(E_arr, pars, T=298.15, n=1):
     i_out = np.zeros_like(E_arr, dtype=float)
-    # Continuation across E for convergence
     i_guess = 0.0
     for k, E in enumerate(E_arr):
         i_guess = newton_current_for_E(E, pars, T=T, n=n, i_init=i_guess)
@@ -166,7 +152,7 @@ if df is not None:
     with np.errstate(divide="ignore", invalid="ignore"):
         i_meas = I / np.where(area_arr<=0, np.nan, area_arr)
 
-    # Sort by E
+    # Sort
     idx = np.argsort(E_raw)
     E = E_raw[idx]
     i_meas = i_meas[idx]
@@ -187,15 +173,15 @@ if df is not None:
         log_iL = st.slider("log10(i_L) [A/cm²]", -6.0, -2.0, -4.0, 0.5)
         Ru_guess = st.number_input("R_u initial (Ω)", value=0.0, min_value=0.0, step=0.1)
 
-    # Bounds: [log_i0a, alpha_a, log_i0c, alpha_c, log_iL, Ecorr, Ru]
-    bounds_lo = np.array([ -12,   0.05,  -12,   0.05,  -6,    np.min(E)-1.0,   0.0 ], float)
-    bounds_hi = np.array([  -2,   0.99,   -3,   0.99,  -2,    np.max(E)+1.0, 1e6 ], float)
-    x0 = np.array([ log_i0a, alpha_a, log_i0c, alpha_c, log_iL, Ecorr, Ru_guess ], float)
+    # Bounds
+    bounds_lo = np.array([-12, 0.05, -12, 0.05, -6, np.min(E)-1.0, 0.0], float)
+    bounds_hi = np.array([ -2, 0.99,  -3, 0.99, -2, np.max(E)+1.0, 1e6], float)
+    x0 = np.array([log_i0a, alpha_a, log_i0c, alpha_c, log_iL, Ecorr, Ru_guess], float)
 
     st.subheader("Fitting window")
     Emin, Emax = float(np.nanmin(E)), float(np.nanmax(E))
-    fit_lo, fit_hi = st.slider("E range (V) to include", min_value=Emin, max_value=Emax, value=(Emin,Emax), step=0.01)
-    mask = (E>=fit_lo) & (E<=fit_hi) & np.isfinite(i_meas)
+    fit_lo, fit_hi = st.slider("E range (V) to include", min_value=Emin, max_value=Emax, value=(Emin, Emax), step=0.01)
+    mask = (E >= fit_lo) & (E <= fit_hi) & np.isfinite(i_meas)
     E_fit = E[mask]
     i_fit = i_meas[mask]
 
@@ -228,7 +214,7 @@ if df is not None:
                 "alpha_c": float(alpha_c),
                 "iL": 10**log_iL,
                 "Ecorr": float(Ecorr),
-                "Ru": float(max(Ru,0.0)),
+                "Ru": float(max(Ru, 0.0)),
             }
             st.success("Fit completed.")
             st.json(pars)
@@ -251,7 +237,7 @@ if df is not None:
             Rp = 1.0 / max(di_deta, 1e-30)
             st.write(f"Polarization resistance Rp (near Ecorr, Ru→0) ≈ **{Rp:.2e} Ω·cm²**")
 
-            # Optional corrosion rate
+            # Corrosion rate
             st.subheader("Corrosion rate (optional)")
             colr1, colr2 = st.columns(2)
             with colr1:
@@ -259,10 +245,10 @@ if df is not None:
             with colr2:
                 rho = st.number_input("Density (g/cm³)", value=7.87, help="E.g., steel ≈ 7.87 g/cm³")
             K = 3.27e-3
-            corr_rate = K * i_corr * EW / max(rho,1e-9)
+            corr_rate = K * i_corr * EW / max(rho, 1e-9)
             st.write(f"Corrosion rate ≈ **{corr_rate:.3f} mm/year**")
 
-            # Build deconvolution over full E
+            # Deconvolution
             E_grid = np.linspace(E.min(), E.max(), 600)
             i_tot = np.zeros_like(E_grid)
             i_an, i_cc, i_cc_act, eta_arr = [], [], [], []
@@ -274,10 +260,10 @@ if df is not None:
                 i_a = pars["i0_a"] * math.exp(k_a * eta_k)
                 i_c_act = - pars["i0_c"] * math.exp(-k_c * eta_k)
                 denom = (i_c_act - pars["iL"])
-                denom = denom if abs(denom)>1e-30 else (1e-30 if denom>0 else -1e-30)
+                denom = denom if abs(denom) > 1e-30 else (1e-30 if denom > 0 else -1e-30)
                 i_c = (i_c_act * (-pars["iL"])) / denom
 
-                i_tot[i_an.__len__()] = i_k
+                i_tot[len(i_an)] = i_k
                 i_an.append(i_a)
                 i_cc.append(i_c)
                 i_cc_act.append(i_c_act)
@@ -339,4 +325,4 @@ else:
     st.info("Upload a CSV/Excel file and map the potential/current columns.")
 
 st.markdown('---')
-st.caption("η = E − E_corr − iRu; i_c via Koutecky–Levich; solved with damped Newton; global least‑squares fit in log‑space.")
+st.caption("η = E − E_corr − iRu; i_c via Koutecky–Levich; solved with damped Newton; global least-squares fit in log-space.")
