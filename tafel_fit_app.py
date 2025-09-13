@@ -1,328 +1,460 @@
+"""
+Streamlit application for multi‑process Tafel fitting
+====================================================
+
+This application provides a convenient interface for fitting electrochemical
+polarisation data to a combination of Tafel and mixed activation/diffusion
+models.  It is designed to handle multiple electrochemical processes
+simultaneously—for example the reduction of hydrogen (HER), reduction of
+oxygen (ORR) and dissolution of iron—and to extract the kinetic parameters
+associated with each process.  The motivation and mathematical basis for
+the fitting procedure are taken from the literature on polarisation curve
+interpretation.  The total measured current at a given potential is the
+sum of the individual contributions from each process.  For a purely
+activation controlled reaction the relationship between overpotential and
+current density is given by the classical Tafel equation
+\(\eta = b\,\log_{10}(i/i_0)\)【228677896600433†L238-L248】.  For systems that show
+diffusion limitation (for example oxygen reduction) the activation and
+diffusion overpotentials are additive and an approximate expression for
+the total current density is
+\(i=\frac{i_L\,i_c}{i_L+i_c}\)【228677896600433†L268-L276】, where \(i_c\) is the activation
+controlled current.  These relations form the basis of the model used in
+this application.
+
+When the script is executed with ``streamlit run tafel_app.py`` it presents
+an interface that allows the user to:
+
+* Upload an Excel file containing potential and current data.
+* Choose which columns correspond to the potential and current.
+* Specify the number of electrochemical processes to model.
+* For each process, choose whether it is purely activation controlled or
+  exhibits mixed activation/diffusion control and whether it is anodic
+  (oxidation, positive current) or cathodic (reduction, negative current).
+* Provide initial guesses and bounds for the kinetic parameters: the
+  exchange current \(i_0\), Tafel slope \(\beta\) (in V per decade), the
+  reversible potential \(E_\text{rev}\) and, where relevant, the limiting
+  current \(i_L\).
+* Fit the model to the data using non‑linear least squares and display the
+  extracted parameters with 95 % confidence intervals.
+* Visualise the measured data and the fitted contributions of the
+  individual processes.
+
+The app uses SciPy’s ``curve_fit`` routine to perform the optimisation.
+Parameter bounds are enforced to keep the optimisation stable; by default
+\(i_0\), \(\beta\) and \(i_L\) are constrained to be positive and \(E_\text{rev}\)
+is allowed to vary within a reasonable range.
+"""
+
 import io
-import json
-import math
+from typing import List, Tuple
+
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
-from scipy.optimize import least_squares
+from scipy.optimize import curve_fit
 
-st.set_page_config(page_title="Global Implicit Tafel Fit (BV + Koutecky–Levich + Ru)", layout="wide")
 
-# Constants
-F = 96485.33212  # C/mol
-R = 8.314462618  # J/mol/K
+def multi_process_model(E: np.ndarray,
+                        params: np.ndarray,
+                        types: List[str],
+                        directions: List[str]) -> np.ndarray:
+    """Compute the total current from multiple processes.
 
-st.title("Global Implicit Tafel Fit")
-st.caption("Single implicit model: Butler–Volmer (anodic + cathodic) + Koutecky–Levich diffusion (ORR) + Ohmic drop Ru. "
-           "Solve point-wise with Newton; fit globally.")
+    Each process contributes either a purely activation controlled current
+    or a mixed activation/diffusion controlled current.  The sign of the
+    current is determined by the direction: cathodic contributions are
+    negative and anodic contributions are positive.
 
-# -------------------- Physics --------------------
-def beta_from_alpha(alpha, n=1, T=298.15):
-    # β (V/dec) = 2.303 RT / (α n F)
-    return 2.303 * R * T / (max(alpha, 1e-6) * n * F)
+    Parameters
+    ----------
+    E : np.ndarray
+        Array of potentials (in volts).
+    params : np.ndarray
+        Flattened parameter vector.  For each process the parameters are
+        ordered as ``[i0, beta, E_rev]`` for activation controlled processes
+        and ``[i0, beta, E_rev, i_L]`` for diffusion limited processes.
+    types : List[str]
+        A list whose elements are either ``"Activation"`` or
+        ``"Mixed"``, specifying the type for each process.
+    directions : List[str]
+        A list whose elements are either ``"Cathodic"`` or ``"Anodic"``,
+        specifying the sign of the current for each process.
 
-def newton_current_for_E(E, pars, T=298.15, n=1, i_init=None):
+    Returns
+    -------
+    np.ndarray
+        Total current as a function of potential.
     """
-    Solve implicit equation for current density i at given potential E:
-      η = E − E_corr − i*Ru
-      i_a = i0_a * exp( +α_a nF η / RT )
-      i_c,act = − i0_c * exp( −α_c nF η / RT )      (cathodic < 0)
-      i_c,eff via Koutecky–Levich: 1/i_c = 1/i_c,act + 1/(−iL)
-      i_total = i_a + i_c,eff
-      Find i such that f(i) = i − (i_a + i_c,eff) = 0
-    Uses damped Newton iterations with analytic df/di via chain rule.
-    """
-    i0_a = pars["i0_a"]
-    alpha_a = pars["alpha_a"]
-    i0_c = pars["i0_c"]
-    alpha_c = pars["alpha_c"]
-    iL = pars["iL"]
-    Ecorr = pars["Ecorr"]
-    Ru = pars["Ru"]
+    i_total = np.zeros_like(E, dtype=float)
+    idx = 0
+    for proc_type, direction in zip(types, directions):
+        i0 = params[idx]
+        beta = params[idx + 1]
+        E_rev = params[idx + 2]
+        idx += 3
 
-    # Initial guess
-    i = 0.0 if i_init is None else float(i_init)
+        # activation component
+        # Using base 10: i_c = i0 * 10 ** ((E - E_rev) / beta)
+        i_c = i0 * np.power(10.0, (E - E_rev) / beta)
 
-    # Precompute factors
-    k_a = (alpha_a * n * F) / (R * T)
-    k_c = (alpha_c * n * F) / (R * T)
-
-    # Damped Newton
-    for _ in range(80):
-        eta = E - Ecorr - i * Ru
-
-        # Activation currents
-        i_a = i0_a * math.exp(k_a * eta)                # anodic, positive
-        i_c_act = - i0_c * math.exp(-k_c * eta)         # cathodic, negative
-
-        # Koutecky–Levich combination for cathodic with diffusion limit (-iL plateau)
-        denom = (i_c_act - iL)
-        if abs(denom) < 1e-30:
-            denom = -1e-30 if denom < 0 else 1e-30
-        i_c = (i_c_act * (-iL)) / denom
-
-        f = i - (i_a + i_c)
-
-        # df/di = 1 - (di_a/dη + di_c/dη)*dη/di
-        di_a_deta = i_a * k_a
-        di_cact_deta = (-i_c_act) * k_c
-        di_c_dg = (iL**2) / (denom**2)
-        di_c_deta = di_c_dg * di_cact_deta
-        di_sum_deta = di_a_deta + di_c_deta
-        d_eta_di = -Ru
-        dsum_di = di_sum_deta * d_eta_di
-        dfi = 1.0 - dsum_di
-
-        # Newton step
-        step = - f / (dfi + 1e-30)
-
-        # Damping
-        lam = 1.0
-        improved = False
-        for _ in range(10):
-            i_trial = i + lam * step
-            eta_t = E - Ecorr - i_trial * Ru
-            i_a_t = i0_a * math.exp(k_a * eta_t)
-            i_c_act_t = - i0_c * math.exp(-k_c * eta_t)
-            denom_t = (i_c_act_t - iL)
-            if abs(denom_t) < 1e-30:
-                denom_t = -1e-30 if denom_t < 0 else 1e-30
-            i_c_t = (i_c_act_t * (-iL)) / denom_t
-            f_t = i_trial - (i_a_t + i_c_t)
-            if abs(f_t) < abs(f):
-                i = i_trial
-                improved = True
-                break
-            lam *= 0.5
-        if not improved:
-            i = i + 0.1 * step
-
-        if abs(f) < 1e-12:
-            break
-
-    return i
-
-def simulate_curve(E_arr, pars, T=298.15, n=1):
-    i_out = np.zeros_like(E_arr, dtype=float)
-    i_guess = 0.0
-    for k, E in enumerate(E_arr):
-        i_guess = newton_current_for_E(E, pars, T=T, n=n, i_init=i_guess)
-        i_out[k] = i_guess
-    return i_out
-
-# -------------------- Data --------------------
-data_file = st.file_uploader("Upload polarization data (CSV/Excel).", type=["csv","xlsx","xls"])
-
-df = None
-if data_file is not None:
-    try:
-        if data_file.name.lower().endswith(".csv"):
-            df = pd.read_csv(data_file)
+        if proc_type == "Mixed":
+            i_L = params[idx]
+            idx += 1
+            # Mixed activation/diffusion: logistic form i_L * i_c / (i_L + i_c)
+            i_proc = (i_L * i_c) / (i_L + i_c)
         else:
-            df = pd.read_excel(data_file)
+            # Pure activation controlled process
+            i_proc = i_c
+
+        # Apply direction sign
+        if direction == "Cathodic":
+            i_proc = -i_proc
+        i_total += i_proc
+
+    return i_total
+
+
+def build_parameter_vectors(types: List[str], directions: List[str],
+                            guesses: List[Tuple[float, float, float, float]],
+                            bounds: List[Tuple[Tuple[float, ...], Tuple[float, ...]]]) -> Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+    """Assemble the initial guess and bounds arrays for curve_fit.
+
+    Parameters
+    ----------
+    types : list of str
+        Process types ("Activation" or "Mixed").
+    directions : list of str
+        Process directions ("Cathodic" or "Anodic").  Not used here but
+        kept for future extension.
+    guesses : list of 4‑tuple
+        For each process, a tuple of initial guesses (i0, beta, E_rev,
+        i_L).  i_L is ignored for activation processes.
+    bounds : list of 2‑tuple of tuples
+        Lower and upper bounds for each parameter of each process.
+
+    Returns
+    -------
+    init_params : np.ndarray
+        Flattened initial guess vector.
+    full_bounds : tuple of np.ndarray
+        Tuple of lower and upper bound arrays.
+    """
+    init_params = []
+    lower_bounds = []
+    upper_bounds = []
+    for proc_type, guess, bnd in zip(types, guesses, bounds):
+        i0_g, beta_g, E_rev_g, i_L_g = guess
+        (i0_min, beta_min, E_rev_min, i_L_min), (i0_max, beta_max, E_rev_max, i_L_max) = bnd
+        # Append parameters for activation or mixed
+        init_params += [i0_g, beta_g, E_rev_g]
+        lower_bounds += [i0_min, beta_min, E_rev_min]
+        upper_bounds += [i0_max, beta_max, E_rev_max]
+        if proc_type == "Mixed":
+            # Add limiting current
+            init_params.append(i_L_g)
+            lower_bounds.append(i_L_min)
+            upper_bounds.append(i_L_max)
+    return np.array(init_params), (np.array(lower_bounds), np.array(upper_bounds))
+
+
+def main() -> None:
+    st.set_page_config(page_title="Multi‑process Tafel Fitting", layout="wide")
+    st.title("Multi‑process Tafel Fitting")
+    st.markdown(
+        """
+        Use this tool to fit polarisation data to a combination of kinetic
+        models.  The total current is modelled as the sum of contributions
+        from each process, each of which can be purely activation controlled
+        (Tafel) or mixed activation/diffusion controlled.  The fitting is
+        performed using non‑linear least squares.
+
+        **Kinetic model background:**
+
+        - For an activation controlled process the overpotential \(\eta\) and
+          current density \(i\) are related by the Tafel equation
+          \(\eta = b\,\log_{10}(i/i_0)\)【228677896600433†L238-L248】, where \(i_0\) is the
+          exchange current and \(b\) is the Tafel slope.
+        - When diffusion limitation is present, the activation and diffusion
+          overpotentials are additive.  An approximate expression for the
+          total current density is given by
+          \(i = \tfrac{i_L i_c}{i_L + i_c}\)【228677896600433†L268-L276】, where \(i_L\) is the limiting
+          current and \(i_c\) is the activation controlled current from the
+          Tafel relation.
+        - The total measured current at a given potential is the algebraic sum
+          of the individual process currents.
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.sidebar.header("Data input")
+    uploaded_file = st.sidebar.file_uploader("Upload an Excel file", type=["xlsx", "xls"])
+    if uploaded_file is None:
+        st.info("Please upload an Excel file to continue.")
+        return
+
+    # Read Excel file
+    try:
+        bytes_data = uploaded_file.read()
+        excel_io = io.BytesIO(bytes_data)
+        df = pd.read_excel(excel_io)
     except Exception as e:
-        st.error(f"Failed to read file: {e}")
+        st.error(f"Failed to read Excel file: {e}")
+        return
 
-if df is not None:
-    st.success(f"Loaded {len(df)} rows.")
-    st.dataframe(df.head(8))
+    if df.empty:
+        st.error("The uploaded Excel file appears to be empty.")
+        return
 
-    col_E = st.selectbox("Potential column", list(df.columns))
-    col_I = st.selectbox("Current column", list(df.columns))
+    cols = df.columns.tolist()
+    st.sidebar.subheader("Column selection")
+    pot_col = st.sidebar.selectbox("Potential (V) column", cols, index=0)
+    cur_col = st.sidebar.selectbox("Current (A) column", cols, index=2 if len(cols) > 2 else 1)
 
-    pot_units = st.selectbox("Potential units", ["V","mV"], index=0)
-    cur_units = st.selectbox("Current units", ["A","mA","uA","nA"], index=1)
-    area_mode = st.radio("Area handling", ["Single value", "From a column"], horizontal=True)
-    if area_mode == "Single value":
-        area_val = st.number_input("Electrode area (cm²)", value=1.0, min_value=1e-9, format="%.6f")
-        A = float(area_val)
-        area_arr = np.full(len(df), A, dtype=float)
-    else:
-        col_A = st.selectbox("Area column", list(df.columns))
-        area_arr = df[col_A].astype(float).to_numpy()
-        A = float(np.nanmedian(area_arr))
+    E_data = df[pot_col].to_numpy(dtype=float)
+    I_data = df[cur_col].to_numpy(dtype=float)
 
-    E_raw = df[col_E].astype(float).to_numpy()
-    if pot_units == "mV":
-        E_raw = E_raw/1000.0
-    I_raw = df[col_I].astype(float).to_numpy()
-    cur_factor = {"A":1.0,"mA":1e-3,"uA":1e-6,"nA":1e-9}[cur_units]
-    I = I_raw * cur_factor
-    with np.errstate(divide="ignore", invalid="ignore"):
-        i_meas = I / np.where(area_arr<=0, np.nan, area_arr)
+    # Optionally filter out NaNs
+    mask = np.isfinite(E_data) & np.isfinite(I_data)
+    E_data = E_data[mask]
+    I_data = I_data[mask]
 
-    # Sort
-    idx = np.argsort(E_raw)
-    E = E_raw[idx]
-    i_meas = i_meas[idx]
+    st.sidebar.subheader("Model configuration")
+    max_processes = 5
+    num_proc = st.sidebar.number_input("Number of processes", min_value=1, max_value=max_processes, value=2, step=1)
 
-    st.subheader("Global parameters & initial guesses")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        T = st.number_input("Temperature (K)", value=298.15, min_value=250.0, max_value=373.15, step=0.5)
-        n = st.number_input("Electrons n", value=1, min_value=1, max_value=4, step=1)
-        Ecorr_guess = float(np.nanmedian(E))
-        Ecorr = st.number_input("E_corr initial (V)", value=Ecorr_guess, step=0.01, format="%.4f")
-    with col2:
-        log_i0a = st.slider("log10(i0_a) [A/cm²]", -12.0, -2.0, -6.0, 0.5)
-        alpha_a = st.number_input("α_a (anodic)", value=0.5, min_value=0.05, max_value=0.99, step=0.01)
-        log_i0c = st.slider("log10(i0_c) [A/cm²] (ORR act.)", -12.0, -3.0, -8.0, 0.5)
-    with col3:
-        alpha_c = st.number_input("α_c (cathodic)", value=0.5, min_value=0.05, max_value=0.99, step=0.01)
-        log_iL = st.slider("log10(i_L) [A/cm²]", -6.0, -2.0, -4.0, 0.5)
-        Ru_guess = st.number_input("R_u initial (Ω)", value=0.0, min_value=0.0, step=0.1)
+    # Initialise lists for process configuration
+    types: List[str] = []
+    directions: List[str] = []
+    guesses: List[Tuple[float, float, float, float]] = []
+    bounds: List[Tuple[Tuple[float, float, float, float], Tuple[float, float, float, float]]] = []
 
-    # Bounds
-    bounds_lo = np.array([-12, 0.05, -12, 0.05, -6, np.min(E)-1.0, 0.0], float)
-    bounds_hi = np.array([ -2, 0.99,  -3, 0.99, -2, np.max(E)+1.0, 1e6], float)
-    x0 = np.array([log_i0a, alpha_a, log_i0c, alpha_c, log_iL, Ecorr, Ru_guess], float)
+    # Provide default guesses based on data extent
+    E_min, E_max = float(np.min(E_data)), float(np.max(E_data))
+    I_abs_max = float(np.max(np.abs(I_data))) if len(I_data) > 0 else 1e-6
 
-    st.subheader("Fitting window")
-    Emin, Emax = float(np.nanmin(E)), float(np.nanmax(E))
-    fit_lo, fit_hi = st.slider("E range (V) to include", min_value=Emin, max_value=Emax, value=(Emin, Emax), step=0.01)
-    mask = (E >= fit_lo) & (E <= fit_hi) & np.isfinite(i_meas)
-    E_fit = E[mask]
-    i_fit = i_meas[mask]
+    for i in range(int(num_proc)):
+        st.sidebar.markdown(f"### Process {i + 1}")
+        p_type = st.sidebar.selectbox(
+            f"Type of process {i + 1}",
+            ("Activation", "Mixed"),
+            index=0,
+            key=f"type_{i}",
+        )
+        direction = st.sidebar.selectbox(
+            f"Direction of process {i + 1}",
+            ("Cathodic", "Anodic"),
+            index=0,
+            key=f"dir_{i}",
+        )
+        # Default guesses depend on magnitude of current
+        default_i0 = I_abs_max * 1e-1 if I_abs_max > 0 else 1e-6
+        default_beta = 0.1
+        default_E_rev = 0.0
+        default_i_L = I_abs_max * 10.0 if I_abs_max > 0 else 1.0
+        i0_g = st.sidebar.number_input(
+            f"Initial guess i₀ for process {i + 1} (A)",
+            min_value=1e-12,
+            value=default_i0,
+            format="%e",
+            key=f"i0_g_{i}",
+        )
+        beta_g = st.sidebar.number_input(
+            f"Initial guess β for process {i + 1} (V/decade)",
+            min_value=1e-4,
+            value=default_beta,
+            format="%f",
+            key=f"beta_g_{i}",
+        )
+        E_rev_g = st.sidebar.number_input(
+            f"Initial guess E_rev for process {i + 1} (V)",
+            min_value=E_min - 1.0,
+            max_value=E_max + 1.0,
+            value=default_E_rev,
+            format="%f",
+            key=f"Erev_g_{i}",
+        )
+        if p_type == "Mixed":
+            i_L_g = st.sidebar.number_input(
+                f"Initial guess i_L for process {i + 1} (A)",
+                min_value=1e-12,
+                value=default_i_L,
+                format="%e",
+                key=f"iL_g_{i}",
+            )
+        else:
+            i_L_g = 1.0  # placeholder, not used
 
-    def residuals(x):
-        log_i0a, alpha_a, log_i0c, alpha_c, log_iL, Ecorr, Ru = x
-        pars = {
-            "i0_a": 10**log_i0a,
-            "alpha_a": alpha_a,
-            "i0_c": 10**log_i0c,
-            "alpha_c": alpha_c,
-            "iL": 10**log_iL,
-            "Ecorr": Ecorr,
-            "Ru": max(Ru, 0.0),
-        }
-        i_model = simulate_curve(E_fit, pars, T=T, n=n)
-        eps = 1e-15
-        r = np.log10(np.clip(np.abs(i_model), eps, None)) - np.log10(np.clip(np.abs(i_fit), eps, None))
-        sign_pen = 0.2 * (np.sign(i_model) - np.sign(i_fit))**2
-        return r + sign_pen
+        # Parameter bounds per process
+        i0_min = st.sidebar.number_input(
+            f"Lower bound i₀ for process {i + 1}",
+            min_value=0.0,
+            value=1e-12,
+            format="%e",
+            key=f"i0_min_{i}",
+        )
+        i0_max = st.sidebar.number_input(
+            f"Upper bound i₀ for process {i + 1}",
+            min_value=1e-12,
+            value=I_abs_max * 1e3 if I_abs_max > 0 else 1.0,
+            format="%e",
+            key=f"i0_max_{i}",
+        )
+        beta_min = st.sidebar.number_input(
+            f"Lower bound β for process {i + 1} (V/decade)",
+            min_value=1e-4,
+            value=1e-4,
+            format="%f",
+            key=f"beta_min_{i}",
+        )
+        beta_max = st.sidebar.number_input(
+            f"Upper bound β for process {i + 1} (V/decade)",
+            min_value=1e-4,
+            value=1.0,
+            format="%f",
+            key=f"beta_max_{i}",
+        )
+        E_rev_min = st.sidebar.number_input(
+            f"Lower bound E_rev for process {i + 1} (V)",
+            min_value=E_min - 5.0,
+            max_value=E_max + 5.0,
+            value=E_min - 0.5,
+            format="%f",
+            key=f"Erev_min_{i}",
+        )
+        E_rev_max = st.sidebar.number_input(
+            f"Upper bound E_rev for process {i + 1} (V)",
+            min_value=E_min - 5.0,
+            max_value=E_max + 5.0,
+            value=E_max + 0.5,
+            format="%f",
+            key=f"Erev_max_{i}",
+        )
+        i_L_min = st.sidebar.number_input(
+            f"Lower bound i_L for process {i + 1}",
+            min_value=0.0,
+            value=1e-12,
+            format="%e",
+            key=f"iL_min_{i}",
+        )
+        i_L_max = st.sidebar.number_input(
+            f"Upper bound i_L for process {i + 1}",
+            min_value=1e-12,
+            value=I_abs_max * 1e3 if I_abs_max > 0 else 1.0,
+            format="%e",
+            key=f"iL_max_{i}",
+        )
 
-    if st.button("Run global fit", type="primary"):
-        try:
-            res = least_squares(residuals, x0, bounds=(bounds_lo, bounds_hi), max_nfev=6000, verbose=0)
-            x = res.x
-            log_i0a, alpha_a, log_i0c, alpha_c, log_iL, Ecorr, Ru = x
-            pars = {
-                "i0_a": 10**log_i0a,
-                "alpha_a": float(alpha_a),
-                "i0_c": 10**log_i0c,
-                "alpha_c": float(alpha_c),
-                "iL": 10**log_iL,
-                "Ecorr": float(Ecorr),
-                "Ru": float(max(Ru, 0.0)),
-            }
-            st.success("Fit completed.")
-            st.json(pars)
+        # Append configuration lists
+        types.append(p_type)
+        directions.append(direction)
+        guesses.append((i0_g, beta_g, E_rev_g, i_L_g))
+        bounds.append(((i0_min, beta_min, E_rev_min, i_L_min), (i0_max, beta_max, E_rev_max, i_L_max)))
 
-            # Derived
-            beta_a = beta_from_alpha(pars["alpha_a"], n=n, T=T)
-            beta_c = beta_from_alpha(pars["alpha_c"], n=n, T=T)
-            st.write(f"β_a ≈ **{beta_a:.3f} V/dec**,  β_c ≈ **{beta_c:.3f} V/dec**")
+    # Build parameter vector and bounds
+    init_params, full_bounds = build_parameter_vectors(types, directions, guesses, bounds)
 
-            i_corr = abs(newton_current_for_E(pars["Ecorr"], pars, T=T, n=n))
-            st.write(f"Estimated i_corr ≈ **{i_corr:.3e} A/cm²**")
+    # Fit button
+    if st.sidebar.button("Fit model"):
+        with st.spinner("Fitting model, please wait..."):
+            try:
+                # Perform curve fitting
+                popt, pcov = curve_fit(
+                    lambda E, *params: multi_process_model(E, np.array(params), types, directions),
+                    E_data,
+                    I_data,
+                    p0=init_params,
+                    bounds=full_bounds,
+                    maxfev=1000000,
+                )
+                # Calculate standard deviations and 95% CIs
+                perr = np.sqrt(np.diag(pcov))
+                ci = 1.96 * perr
+                # Unpack parameters per process
+                result_rows = []
+                idx = 0
+                for i in range(int(num_proc)):
+                    proc_type = types[i]
+                    direction = directions[i]
+                    name = f"Process {i + 1}"
+                    i0 = popt[idx]
+                    i0_err = ci[idx]
+                    beta = popt[idx + 1]
+                    beta_err = ci[idx + 1]
+                    E_rev = popt[idx + 2]
+                    E_rev_err = ci[idx + 2]
+                    idx += 3
+                    row = {
+                        "Process": name,
+                        "Type": proc_type,
+                        "Direction": direction,
+                        "i0 (A)": i0,
+                        "i0 CI": i0_err,
+                        "β (V/dec)": beta,
+                        "β CI": beta_err,
+                        "E_rev (V)": E_rev,
+                        "E_rev CI": E_rev_err,
+                    }
+                    if proc_type == "Mixed":
+                        i_L = popt[idx]
+                        i_L_err = ci[idx]
+                        idx += 1
+                        row.update({"i_L (A)": i_L, "i_L CI": i_L_err})
+                    result_rows.append(row)
+                result_df = pd.DataFrame(result_rows)
+            except Exception as e:
+                st.error(f"Error during fitting: {e}")
+                return
+        st.success("Fitting complete!")
+        st.subheader("Fitted parameters (±95 % CI)")
+        st.dataframe(result_df)
 
-            # Rp (Ru→0) numerical
-            def i_at_eta(eta):
-                ptmp = dict(pars); ptmp["Ru"] = 0.0
-                E0 = pars["Ecorr"] + eta
-                return newton_current_for_E(E0, ptmp, T=T, n=n)
-            deta = 1e-4
-            di_deta = (i_at_eta(deta) - i_at_eta(-deta)) / (2*deta)
-            Rp = 1.0 / max(di_deta, 1e-30)
-            st.write(f"Polarization resistance Rp (near Ecorr, Ru→0) ≈ **{Rp:.2e} Ω·cm²**")
+        # Plot measured and fitted data
+        st.subheader("Polarisation curve and fitted contributions")
+        # Create a high resolution potential grid for smooth curves
+        E_grid = np.linspace(E_data.min(), E_data.max(), 400)
+        total_fit = multi_process_model(E_grid, popt, types, directions)
+        # Compute each process contribution
+        contributions = []
+        idx = 0
+        for i, (p_type, direction) in enumerate(zip(types, directions)):
+            i0 = popt[idx]
+            beta = popt[idx + 1]
+            E_rev = popt[idx + 2]
+            idx += 3
+            i_c = i0 * np.power(10.0, (E_grid - E_rev) / beta)
+            if p_type == "Mixed":
+                i_L = popt[idx]
+                idx += 1
+                i_proc = (i_L * i_c) / (i_L + i_c)
+            else:
+                i_proc = i_c
+            if direction == "Cathodic":
+                i_proc = -i_proc
+            contributions.append(i_proc)
+        # Create Altair chart data
+        import altair as alt
+        chart_data = pd.DataFrame({
+            "Potential (V)": np.concatenate([E_data, E_grid]),
+            "Current (A)": np.concatenate([I_data, total_fit]),
+            "Series": ["Measured"] * len(E_data) + ["Fitted total"] * len(E_grid),
+        })
+        for i, contrib in enumerate(contributions):
+            chart_data = pd.concat([
+                chart_data,
+                pd.DataFrame({
+                    "Potential (V)": E_grid,
+                    "Current (A)": contrib,
+                    "Series": [f"Process {i + 1}"] * len(E_grid),
+                })
+            ], ignore_index=True)
+        # Plot lines
+        line_chart = alt.Chart(chart_data).mark_line().encode(
+            x="Potential (V):Q",
+            y="Current (A):Q",
+            color="Series:N",
+        ).interactive()
+        st.altair_chart(line_chart, use_container_width=True)
 
-            # Corrosion rate
-            st.subheader("Corrosion rate (optional)")
-            colr1, colr2 = st.columns(2)
-            with colr1:
-                EW = st.number_input("Equivalent weight (g/equiv)", value=27.92, help="E.g., iron ≈ 27.92 g/equiv")
-            with colr2:
-                rho = st.number_input("Density (g/cm³)", value=7.87, help="E.g., steel ≈ 7.87 g/cm³")
-            K = 3.27e-3
-            corr_rate = K * i_corr * EW / max(rho, 1e-9)
-            st.write(f"Corrosion rate ≈ **{corr_rate:.3f} mm/year**")
 
-            # Deconvolution
-            E_grid = np.linspace(E.min(), E.max(), 600)
-            i_tot = np.zeros_like(E_grid)
-            i_an, i_cc, i_cc_act, eta_arr = [], [], [], []
-            for Ek in E_grid:
-                i_k = newton_current_for_E(Ek, pars, T=T, n=n)
-                eta_k = Ek - pars["Ecorr"] - i_k*pars["Ru"]
-                k_a = (pars["alpha_a"] * n * F) / (R * T)
-                k_c = (pars["alpha_c"] * n * F) / (R * T)
-                i_a = pars["i0_a"] * math.exp(k_a * eta_k)
-                i_c_act = - pars["i0_c"] * math.exp(-k_c * eta_k)
-                denom = (i_c_act - pars["iL"])
-                denom = denom if abs(denom) > 1e-30 else (1e-30 if denom > 0 else -1e-30)
-                i_c = (i_c_act * (-pars["iL"])) / denom
-
-                i_tot[len(i_an)] = i_k
-                i_an.append(i_a)
-                i_cc.append(i_c)
-                i_cc_act.append(i_c_act)
-                eta_arr.append(eta_k)
-
-            i_an = np.array(i_an); i_cc = np.array(i_cc); i_cc_act = np.array(i_cc_act); eta_arr = np.array(eta_arr)
-
-            st.subheader("Semi-log plot")
-            fig, ax = plt.subplots()
-            ax.semilogy(E, np.abs(i_meas), ".", label="Data")
-            ax.semilogy(E_grid, np.abs(i_tot), "-", label="Global fit")
-            ax.semilogy(E_grid, np.abs(i_an), "--", label="Anodic BV")
-            ax.semilogy(E_grid, np.abs(i_cc), "--", label="ORR (KL)")
-            ax.set_xlabel("E (V)")
-            ax.set_ylabel("|i| (A/cm²)")
-            ax.grid(True, which="both")
-            ax.legend()
-            st.pyplot(fig)
-
-            # Exports
-            out = {
-                "parameters": pars,
-                "derived": {
-                    "beta_a_V_per_dec": beta_a,
-                    "beta_c_V_per_dec": beta_c,
-                    "i_corr_Acm2": i_corr,
-                    "Rp_Ohm_cm2": Rp
-                }
-            }
-            st.download_button("Download parameters (JSON)", data=json.dumps(out, indent=2).encode("utf-8"),
-                               file_name="global_tafel_params.json", mime="application/json")
-
-            df_out = pd.DataFrame({
-                "E_V": E_grid,
-                "i_total_Acm2": i_tot,
-                "i_anodic_Acm2": i_an,
-                "i_cathodic_KL_Acm2": i_cc,
-                "i_cathodic_activation_Acm2": i_cc_act,
-                "eta_V": eta_arr
-            })
-            st.download_button("Download deconvoluted curve (CSV)",
-                               data=df_out.to_csv(index=False).encode("utf-8"),
-                               file_name="global_tafel_deconvoluted.csv",
-                               mime="text/csv")
-
-        except Exception as e:
-            st.error(f"Fit failed: {e}")
-
-    # Preview
-    with st.expander("Preview (data only)"):
-        fig2, ax2 = plt.subplots()
-        ax2.semilogy(E, np.abs(i_meas), ".", label="Data")
-        ax2.set_xlabel("E (V)")
-        ax2.set_ylabel("|i| (A/cm²)")
-        ax2.grid(True, which="both")
-        st.pyplot(fig2)
-
-else:
-    st.info("Upload a CSV/Excel file and map the potential/current columns.")
-
-st.markdown('---')
-st.caption("η = E − E_corr − iRu; i_c via Koutecky–Levich; solved with damped Newton; global least-squares fit in log-space.")
+if __name__ == "__main__":
+    main()
