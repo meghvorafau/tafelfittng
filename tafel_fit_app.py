@@ -14,7 +14,7 @@ st.set_page_config(page_title="Global Implicit Tafel Fit (BV + KL + Ru)", layout
 F = 96485.33212
 R = 8.314462618
 
-st.title("Global Implicit Tafel Fit (Patched Version)")
+st.title("Global Implicit Tafel Fit")
 
 def beta_from_alpha(alpha, n=1, T=298.15):
     return 2.303 * R * T / (max(alpha, 1e-6) * n * F)
@@ -122,7 +122,7 @@ if data_file is not None:
             "iL":10**x[4],"Ecorr":x[5],"Ru":max(x[6],0)}
 
     # --- Display real parameters ---
-    st.subheader("Extracted Parameters (Real Fit)")
+    st.subheader("Extracted Parameters")
     st.json(pars)
 
     beta_a = beta_from_alpha(pars["alpha_a"])
