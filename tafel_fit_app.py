@@ -29,7 +29,7 @@ def newton_current_for_E(E, pars, T=298.15, n=1, i_init=None):
     k_a = (alpha_a * n * F) / (R * T)
     k_c = (alpha_c * n * F) / (R * T)
 
-    for _ in range(80):
+    for _ in range(20):
         eta = E - Ecorr - i * Ru
         i_a = i0_a * math.exp(k_a * eta)
         i_c_act = - i0_c * math.exp(-k_c * eta)
