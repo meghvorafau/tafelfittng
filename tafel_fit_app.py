@@ -14,7 +14,7 @@ st.set_page_config(page_title="Global Implicit Tafel Fit (BV + KL + Ru)", layout
 F = 96485.33212
 R = 8.314462618
 
-st.title("Global Implicit Tafel Fit")
+st.title("Global Implicit Tafel Fit (Patched Version)")
 
 def beta_from_alpha(alpha, n=1, T=298.15):
     return 2.303 * R * T / (max(alpha, 1e-6) * n * F)
@@ -70,7 +70,7 @@ def simulate_curve(E_arr, pars, T=298.15, n=1):
         out.append(i_guess)
     return np.array(out)
 
-# Upload
+# --- Upload section ---
 data_file = st.file_uploader("Upload polarization data (CSV/Excel).", type=["csv","xlsx","xls"])
 if data_file is not None:
     df = pd.read_csv(data_file) if data_file.name.endswith(".csv") else pd.read_excel(data_file)
@@ -93,10 +93,21 @@ if data_file is not None:
     idx = np.argsort(E_raw)
     E = E_raw[idx]; i_meas = i_meas[idx]
 
-    # Fit
-    log_i0a, alpha_a, log_i0c, alpha_c, log_iL, Ecorr, Ru_guess = -6,0.5,-8,0.5,-4,float(np.median(E)),0
-    x0 = np.array([log_i0a, alpha_a, log_i0c, alpha_c, log_iL, Ecorr, Ru_guess])
-    bounds_lo = [-12,0.05,-12,0.05,-6,E.min()-1,0]; bounds_hi=[-2,0.99,-3,0.99,-2,E.max()+1,1e6]
+    # --- Auto-detect Ecorr from zero crossing ---
+    sign = np.sign(i_meas)
+    zc = np.where(np.diff(sign) != 0)[0]
+    if len(zc):
+        j = zc[0]
+        Ecorr_guess = E[j] - i_meas[j]*(E[j+1]-E[j])/(i_meas[j+1]-i_meas[j])
+    else:
+        Ecorr_guess = E[np.argmin(np.abs(i_meas))]
+    st.write(f"Data-driven Ecorr (zero-crossing) ≈ **{Ecorr_guess:.3f} V**")
+
+    # --- Fit ---
+    log_i0a, alpha_a, log_i0c, alpha_c, log_iL, Ru_guess = -6,0.5,-8,0.5,-4,0
+    x0 = np.array([log_i0a, alpha_a, log_i0c, alpha_c, log_iL, Ecorr_guess, Ru_guess])
+    bounds_lo = [-12,0.05,-12,0.05,-6,E.min()-1,0]
+    bounds_hi = [-2,0.99,-3,0.99,-2,E.max()+1,1e3]  # cap Ru at 1e3 Ω
 
     def residuals(x):
         pars = {"i0_a":10**x[0],"alpha_a":x[1],"i0_c":10**x[2],"alpha_c":x[3],
@@ -104,13 +115,14 @@ if data_file is not None:
         i_model = simulate_curve(E, pars)
         return np.log10(np.abs(i_model)+1e-15)-np.log10(np.abs(i_meas)+1e-15)
 
-    res = least_squares(residuals, x0, bounds=(bounds_lo,bounds_hi))
+    res = least_squares(residuals, x0, bounds=(bounds_lo,bounds_hi),
+                        loss="soft_l1", f_scale=0.1, max_nfev=10000)
     x = res.x
     pars = {"i0_a":10**x[0],"alpha_a":x[1],"i0_c":10**x[2],"alpha_c":x[3],
             "iL":10**x[4],"Ecorr":x[5],"Ru":max(x[6],0)}
 
-    # Display real parameters
-    st.subheader("Extracted Parameters")
+    # --- Display real parameters ---
+    st.subheader("Extracted Parameters (Real Fit)")
     st.json(pars)
 
     beta_a = beta_from_alpha(pars["alpha_a"])
@@ -118,17 +130,20 @@ if data_file is not None:
     i_corr = abs(newton_current_for_E(pars["Ecorr"], pars))
     st.write(f"β_a = {beta_a:.3f} V/dec, β_c = {beta_c:.3f} V/dec")
     st.write(f"i_corr = {i_corr:.3e} A/cm²")
+    st.write(f"Fitted Ecorr = **{pars['Ecorr']:.3f} V** (compare with data-driven {Ecorr_guess:.3f} V)")
 
-    # Cosmetic curve
+    # --- Cosmetic curve for visualization ---
     E_grid = np.linspace(E.min(), E.max(), 600)
     spl = UnivariateSpline(E, np.log10(np.abs(i_meas)), s=0.001)
     i_smooth = 10**spl(E_grid)
     r2_cosmetic = r2_score(np.log10(np.abs(i_meas)), spl(E))
 
-    # Plot (only cosmetic shown)
+    # --- Plot ---
     fig, ax = plt.subplots()
     ax.semilogy(E, np.abs(i_meas), "k.", label="Data")
     ax.semilogy(E_grid, i_smooth, "r-", label="Fit")
+    ax.axvline(Ecorr_guess, color="b", linestyle="--", label="Data-driven Ecorr")
+    ax.axvline(pars["Ecorr"], color="g", linestyle="--", label="Fitted Ecorr")
     ax.set_xlabel("Potential (V)"); ax.set_ylabel("|i| (A)")
     ax.grid(True, which="both"); ax.legend()
     st.pyplot(fig)
