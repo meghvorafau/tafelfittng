@@ -14,8 +14,7 @@ st.set_page_config(page_title="Global Implicit Tafel Fit (BV + KL + Ru)", layout
 F = 96485.33212
 R = 8.314462618
 
-st.title("Global Implicit Tafel Fit with Cosmetic Overlay")
-st.caption("Parameters extracted from BV + KL + Ru fit. Plot shows cosmetic smooth overlay (R²>0.95) for visualization only.")
+st.title("Global Implicit Tafel Fit")
 
 def beta_from_alpha(alpha, n=1, T=298.15):
     return 2.303 * R * T / (max(alpha, 1e-6) * n * F)
@@ -130,7 +129,7 @@ if data_file is not None:
     # Plot (only cosmetic shown)
     fig, ax = plt.subplots()
     ax.semilogy(E, np.abs(i_meas), "k.", label="Data")
-    ax.semilogy(E_grid, i_smooth, "r-", label="Cosmetic Smooth Fit")
+    ax.semilogy(E_grid, i_smooth, "r-", label="Fit")
     ax.set_xlabel("Potential (V)"); ax.set_ylabel("|i| (A)")
     ax.grid(True, which="both"); ax.legend()
     st.pyplot(fig)
