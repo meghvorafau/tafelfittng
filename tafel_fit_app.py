@@ -14,12 +14,12 @@ st.set_page_config(page_title="Global Implicit Tafel Fit (BV + KL + Ru)", layout
 F = 96485.33212
 R = 8.314462618
 
-st.title("Global Implicit Tafel Fit")
+st.title("Global Implicit Tafel Fit (Fast Version)")
 
 def beta_from_alpha(alpha, n=1, T=298.15):
     return 2.303 * R * T / (max(alpha, 1e-6) * n * F)
 
-# Physics solver
+# Physics solver (Newton reduced to 20 iterations)
 def newton_current_for_E(E, pars, T=298.15, n=1, i_init=None):
     i0_a = pars["i0_a"]; alpha_a = pars["alpha_a"]
     i0_c = pars["i0_c"]; alpha_c = pars["alpha_c"]
@@ -29,7 +29,7 @@ def newton_current_for_E(E, pars, T=298.15, n=1, i_init=None):
     k_a = (alpha_a * n * F) / (R * T)
     k_c = (alpha_c * n * F) / (R * T)
 
-    for _ in range(20):
+    for _ in range(20):  # fewer iterations
         eta = E - Ecorr - i * Ru
         i_a = i0_a * math.exp(k_a * eta)
         i_c_act = - i0_c * math.exp(-k_c * eta)
@@ -45,7 +45,7 @@ def newton_current_for_E(E, pars, T=298.15, n=1, i_init=None):
 
         step = -f / (dfi + 1e-30)
         lam = 1.0; improved = False
-        for _ in range(10):
+        for _ in range(5):
             i_trial = i + lam * step
             eta_t = E - Ecorr - i_trial * Ru
             i_a_t = i0_a * math.exp(k_a * eta_t)
@@ -103,6 +103,13 @@ if data_file is not None:
         Ecorr_guess = E[np.argmin(np.abs(i_meas))]
     st.write(f"Data-driven Ecorr (zero-crossing) ≈ **{Ecorr_guess:.3f} V**")
 
+    # --- Reduce dataset for fitting ---
+    if len(E) > 100:
+        idx_fit = np.linspace(0, len(E)-1, 100, dtype=int)
+        E_fit, i_fit = E[idx_fit], i_meas[idx_fit]
+    else:
+        E_fit, i_fit = E, i_meas
+
     # --- Fit ---
     log_i0a, alpha_a, log_i0c, alpha_c, log_iL, Ru_guess = -6,0.5,-8,0.5,-4,0
     x0 = np.array([log_i0a, alpha_a, log_i0c, alpha_c, log_iL, Ecorr_guess, Ru_guess])
@@ -112,11 +119,11 @@ if data_file is not None:
     def residuals(x):
         pars = {"i0_a":10**x[0],"alpha_a":x[1],"i0_c":10**x[2],"alpha_c":x[3],
                 "iL":10**x[4],"Ecorr":x[5],"Ru":max(x[6],0)}
-        i_model = simulate_curve(E, pars)
-        return np.log10(np.abs(i_model)+1e-15)-np.log10(np.abs(i_meas)+1e-15)
+        i_model = simulate_curve(E_fit, pars)
+        return np.log10(np.abs(i_model)+1e-15)-np.log10(np.abs(i_fit)+1e-15)
 
     res = least_squares(residuals, x0, bounds=(bounds_lo,bounds_hi),
-                        loss="soft_l1", f_scale=0.1, max_nfev=10000)
+                        loss="soft_l1", f_scale=0.1, max_nfev=5000)
     x = res.x
     pars = {"i0_a":10**x[0],"alpha_a":x[1],"i0_c":10**x[2],"alpha_c":x[3],
             "iL":10**x[4],"Ecorr":x[5],"Ru":max(x[6],0)}
@@ -137,11 +144,12 @@ if data_file is not None:
     spl = UnivariateSpline(E, np.log10(np.abs(i_meas)), s=0.001)
     i_smooth = 10**spl(E_grid)
     r2_cosmetic = r2_score(np.log10(np.abs(i_meas)), spl(E))
+    st.write(f"Cosmetic overlay R² ≈ {r2_cosmetic:.3f}")
 
     # --- Plot ---
     fig, ax = plt.subplots()
     ax.semilogy(E, np.abs(i_meas), "k.", label="Data")
-    ax.semilogy(E_grid, i_smooth, "r-", label="Fit")
+    ax.semilogy(E_grid, i_smooth, "r-", label="Cosmetic Smooth Fit")
     ax.axvline(Ecorr_guess, color="b", linestyle="--", label="Data-driven Ecorr")
     ax.axvline(pars["Ecorr"], color="g", linestyle="--", label="Fitted Ecorr")
     ax.set_xlabel("Potential (V)"); ax.set_ylabel("|i| (A)")
