@@ -9,17 +9,17 @@ from scipy.optimize import least_squares
 from scipy.interpolate import UnivariateSpline
 from sklearn.metrics import r2_score
 
-st.set_page_config(page_title="Global Implicit Tafel Fit (BV + KL + Ru)", layout="wide")
+st.set_page_config(page_title="Global Implicit Tafel Fit (Two-Stage)", layout="wide")
 
 F = 96485.33212
 R = 8.314462618
 
-st.title("Global Implicit Tafel Fit (Fast Version)")
+st.title("Global Implicit Tafel Fit (Two-Stage Version)")
 
 def beta_from_alpha(alpha, n=1, T=298.15):
     return 2.303 * R * T / (max(alpha, 1e-6) * n * F)
 
-# Physics solver (Newton reduced to 20 iterations)
+# ---- Physics solver ----
 def newton_current_for_E(E, pars, T=298.15, n=1, i_init=None):
     i0_a = pars["i0_a"]; alpha_a = pars["alpha_a"]
     i0_c = pars["i0_c"]; alpha_c = pars["alpha_c"]
@@ -29,7 +29,7 @@ def newton_current_for_E(E, pars, T=298.15, n=1, i_init=None):
     k_a = (alpha_a * n * F) / (R * T)
     k_c = (alpha_c * n * F) / (R * T)
 
-    for _ in range(20):  # fewer iterations
+    for _ in range(20):  # fewer iterations for speed
         eta = E - Ecorr - i * Ru
         i_a = i0_a * math.exp(k_a * eta)
         i_c_act = - i0_c * math.exp(-k_c * eta)
@@ -70,7 +70,7 @@ def simulate_curve(E_arr, pars, T=298.15, n=1):
         out.append(i_guess)
     return np.array(out)
 
-# --- Upload section ---
+# ---- Upload ----
 data_file = st.file_uploader("Upload polarization data (CSV/Excel).", type=["csv","xlsx","xls"])
 if data_file is not None:
     df = pd.read_csv(data_file) if data_file.name.endswith(".csv") else pd.read_excel(data_file)
@@ -93,7 +93,7 @@ if data_file is not None:
     idx = np.argsort(E_raw)
     E = E_raw[idx]; i_meas = i_meas[idx]
 
-    # --- Auto-detect Ecorr from zero crossing ---
+    # ---- Auto-detect Ecorr ----
     sign = np.sign(i_meas)
     zc = np.where(np.diff(sign) != 0)[0]
     if len(zc):
@@ -103,32 +103,54 @@ if data_file is not None:
         Ecorr_guess = E[np.argmin(np.abs(i_meas))]
     st.write(f"Data-driven Ecorr (zero-crossing) ≈ **{Ecorr_guess:.3f} V**")
 
-    # --- Reduce dataset for fitting ---
-    if len(E) > 100:
-        idx_fit = np.linspace(0, len(E)-1, 100, dtype=int)
-        E_fit, i_fit = E[idx_fit], i_meas[idx_fit]
-    else:
-        E_fit, i_fit = E, i_meas
-
-    # --- Fit ---
+    # ---- Stage A: local fit ----
     log_i0a, alpha_a, log_i0c, alpha_c, log_iL, Ru_guess = -6,0.5,-8,0.5,-4,0
     x0 = np.array([log_i0a, alpha_a, log_i0c, alpha_c, log_iL, Ecorr_guess, Ru_guess])
-    bounds_lo = [-12,0.05,-12,0.05,-6,E.min()-1,0]
-    bounds_hi = [-2,0.99,-3,0.99,-2,E.max()+1,1e3]  # cap Ru at 1e3 Ω
 
-    def residuals(x):
+    w_half = 0.20  # 200 mV window
+    maskA = (E >= Ecorr_guess - w_half) & (E <= Ecorr_guess + w_half)
+    E_A, i_A = E[maskA], i_meas[maskA]
+
+    bounds_lo_A = [-12,0.05,-12,0.05,-6,E.min()-1,0]
+    bounds_hi_A = [-2, 0.99,-3, 0.99,-2,E.max()+1,100]
+
+    def residuals_A(x):
         pars = {"i0_a":10**x[0],"alpha_a":x[1],"i0_c":10**x[2],"alpha_c":x[3],
                 "iL":10**x[4],"Ecorr":x[5],"Ru":max(x[6],0)}
-        i_model = simulate_curve(E_fit, pars)
-        return np.log10(np.abs(i_model)+1e-15)-np.log10(np.abs(i_fit)+1e-15)
+        i_model = simulate_curve(E_A, pars)
+        r_lin = i_model - i_A
+        sign_pen = 0.1 * (np.sign(i_model) - np.sign(i_A))**2
+        return r_lin + sign_pen
 
-    res = least_squares(residuals, x0, bounds=(bounds_lo,bounds_hi),
-                        loss="soft_l1", f_scale=0.1, max_nfev=5000)
-    x = res.x
+    resA = least_squares(residuals_A, x0, bounds=(bounds_lo_A, bounds_hi_A),
+                         loss="soft_l1", f_scale=0.5, max_nfev=3000)
+    xA = resA.x
+
+    # ---- Stage B: global fit ----
+    sigma_E = 0.05  # 50 mV prior width
+    lambda_E = 1.0
+    bounds_lo_B = [-12,0.05,-12,0.05,-6,E.min()-1,0]
+    bounds_hi_B = [-2, 0.99,-3, 0.99,-2,E.max()+1,1e3]
+
+    def residuals_B(x):
+        pars = {"i0_a":10**x[0],"alpha_a":x[1],"i0_c":10**x[2],"alpha_c":x[3],
+                "iL":10**x[4],"Ecorr":x[5],"Ru":max(x[6],0)}
+        i_model = simulate_curve(E, pars)
+        eps = 1e-15
+        r = np.log10(np.abs(i_model)+eps) - np.log10(np.abs(i_meas)+eps)
+        r_prior = lambda_E * (x[5] - xA[5]) / sigma_E
+        near = np.abs(E - Ecorr_guess) <= 0.2
+        sign_pen = np.zeros_like(r)
+        sign_pen[near] = 0.1 * (np.sign(i_model[near]) - np.sign(i_meas[near]))**2
+        return np.hstack([r + sign_pen, r_prior])
+
+    resB = least_squares(residuals_B, xA, bounds=(bounds_lo_B, bounds_hi_B),
+                         loss="soft_l1", f_scale=0.2, max_nfev=6000)
+    x = resB.x
     pars = {"i0_a":10**x[0],"alpha_a":x[1],"i0_c":10**x[2],"alpha_c":x[3],
             "iL":10**x[4],"Ecorr":x[5],"Ru":max(x[6],0)}
 
-    # --- Display real parameters ---
+    # ---- Results ----
     st.subheader("Extracted Parameters")
     st.json(pars)
 
@@ -137,20 +159,21 @@ if data_file is not None:
     i_corr = abs(newton_current_for_E(pars["Ecorr"], pars))
     st.write(f"β_a = {beta_a:.3f} V/dec, β_c = {beta_c:.3f} V/dec")
     st.write(f"i_corr = {i_corr:.3e} A/cm²")
-    st.write(f"Fitted Ecorr = **{pars['Ecorr']:.3f} V** (compare with data-driven {Ecorr_guess:.3f} V)")
+    st.write(f"Stage A Ecorr = {xA[5]:.3f} V, Fitted Ecorr (Stage B) = **{pars['Ecorr']:.3f} V**, Data-driven = {Ecorr_guess:.3f} V")
 
-    # --- Cosmetic curve for visualization ---
+    # ---- Cosmetic curve ----
     E_grid = np.linspace(E.min(), E.max(), 600)
     spl = UnivariateSpline(E, np.log10(np.abs(i_meas)), s=0.001)
     i_smooth = 10**spl(E_grid)
     r2_cosmetic = r2_score(np.log10(np.abs(i_meas)), spl(E))
     st.write(f"Cosmetic overlay R² ≈ {r2_cosmetic:.3f}")
 
-    # --- Plot ---
+    # ---- Plot ----
     fig, ax = plt.subplots()
     ax.semilogy(E, np.abs(i_meas), "k.", label="Data")
-    ax.semilogy(E_grid, i_smooth, "r-", label="Cosmetic Smooth Fit")
+    ax.semilogy(E_grid, i_smooth, "r-", label="Cosmetic Fit")
     ax.axvline(Ecorr_guess, color="b", linestyle="--", label="Data-driven Ecorr")
+    ax.axvline(xA[5], color="orange", linestyle="--", label="Stage A Ecorr")
     ax.axvline(pars["Ecorr"], color="g", linestyle="--", label="Fitted Ecorr")
     ax.set_xlabel("Potential (V)"); ax.set_ylabel("|i| (A)")
     ax.grid(True, which="both"); ax.legend()
