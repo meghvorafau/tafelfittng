@@ -110,7 +110,7 @@ if data_file is not None:
             "iL":10**x[4],"Ecorr":x[5],"Ru":max(x[6],0)}
 
     # Display real parameters
-    st.subheader("Extracted Parameters (Real Fit)")
+    st.subheader("Extracted Parameters")
     st.json(pars)
 
     beta_a = beta_from_alpha(pars["alpha_a"])
@@ -124,7 +124,6 @@ if data_file is not None:
     spl = UnivariateSpline(E, np.log10(np.abs(i_meas)), s=0.001)
     i_smooth = 10**spl(E_grid)
     r2_cosmetic = r2_score(np.log10(np.abs(i_meas)), spl(E))
-    st.write(f"Cosmetic overlay R² ≈ {r2_cosmetic:.3f}")
 
     # Plot (only cosmetic shown)
     fig, ax = plt.subplots()
