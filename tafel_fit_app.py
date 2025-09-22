@@ -167,7 +167,6 @@ if data_file is not None:
     ax.semilogy(E, np.abs(i_meas), "k.", label="Data")
     ax.semilogy(E_grid, i_smooth, "r-", label="Fit")
     ax.axvline(Ecorr_guess, color="b", linestyle="--", label="Ecorr")
-    ax.axvline(pars["Ecorr"], color="g", linestyle="--", label="Fitted Ecorr")
 
     if cath_region:
         ax.axvspan(cath_region[0], cath_region[1], color="blue", alpha=0.1, label="Cathodic active")
